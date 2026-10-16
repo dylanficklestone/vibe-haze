@@ -1,0 +1,6 @@
+{
+  "name": "SG AirWatch - Live Singapore PSI & PM2.5 Air Quality Tracker",
+  "description": "Real-time Singapore air quality tracking app for live 24-hr PSI and 1-hr PM2.5 levels across all regions with interactive map and push notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
