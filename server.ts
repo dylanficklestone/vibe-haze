@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import healthHandler from './api/health';
 import psiHandler from './api/psi';
 import pm25Handler from './api/pm25';
+import onemapHandler from './api/onemap';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,6 +20,7 @@ async function startServer() {
   app.all('/api/health', (req, res) => healthHandler(req, res));
   app.all('/api/psi', (req, res) => psiHandler(req, res));
   app.all('/api/pm25', (req, res) => pm25Handler(req, res));
+  app.all('/api/onemap', (req, res) => onemapHandler(req, res));
 
   // Also support /api/psi/ts in case of path-based query
   app.all('/api/psi/ts', (req, res) => psiHandler(req, res));

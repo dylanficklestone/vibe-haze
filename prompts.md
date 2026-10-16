@@ -42,3 +42,17 @@ GET https://api-open.data.gov.sg/v2/real-time/api/pm25
 ```text
 collate all prompts in the chat as a md file named prompts.md
 ```
+
+---
+
+### Prompt 5: OneMap Singapore Live Search Endpoint
+
+```text
+add a serverless end point that pulls live data from onemap singapore using the following endpoint:
+GET https://www.onemap.gov.sg/api/common/elastic/search?searchVal=178903&returnGeom=Y&getAddrDetails=Y&pageNum=1
+
+store this in /api folder in the project root level, NOT the src folder
+include /health.ts and psi/ts within the same subfolder
+there is no key required for this service
+```
+
