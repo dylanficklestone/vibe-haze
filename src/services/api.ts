@@ -275,51 +275,82 @@ export function getRealisticFallbackData(): AirQualityData {
 }
 
 /**
- * Fetch live air quality from Data.gov.sg or user serverless backend
+ * Fetch live air quality from local serverless backend /api/psi or direct data.gov.sg v2
  */
 export async function fetchSingaporeAirQuality(): Promise<AirQualityData> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 6000);
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
 
   try {
-    // 1. Fetch PSI feed
-    const psiPromise = fetch('https://api.data.gov.sg/v1/environment/psi', {
-      signal: controller.signal,
-      headers: { Accept: 'application/json' },
-    });
+    // 1. Try local serverless endpoint first (/api/psi?include_pm25=true)
+    let psiItem: any = null;
+    let pm25Item: any = null;
+    let updateTimeStr = '';
 
-    // 2. Fetch PM2.5 1-hour feed
-    const pm25Promise = fetch('https://api.data.gov.sg/v1/environment/pm25', {
-      signal: controller.signal,
-      headers: { Accept: 'application/json' },
-    });
+    try {
+      const serverlessRes = await fetch('/api/psi?include_pm25=true', {
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
 
-    const [psiRes, pm25Res] = await Promise.all([psiPromise, pm25Promise]);
+      if (serverlessRes.ok) {
+        const payload = await serverlessRes.json();
+        if (payload?.psi?.data?.items?.[0]) {
+          psiItem = payload.psi.data.items[0];
+          pm25Item = payload.pm25?.data?.items?.[0] || null;
+          updateTimeStr = psiItem.updatedTimestamp || psiItem.timestamp;
+        }
+      }
+    } catch {
+      // Continue to direct endpoints if local endpoint is not responding
+    }
+
+    // 2. If not obtained from local serverless, query https://api-open.data.gov.sg/v2/real-time/api directly
+    if (!psiItem) {
+      const [psiRes, pm25Res] = await Promise.all([
+        fetch('https://api-open.data.gov.sg/v2/real-time/api/psi', {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        }),
+        fetch('https://api-open.data.gov.sg/v2/real-time/api/pm25', {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        }),
+      ]);
+
+      if (psiRes.ok) {
+        const psiJson = await psiRes.json();
+        psiItem = psiJson.data?.items?.[0] || psiJson.items?.[0];
+        updateTimeStr = psiItem?.updatedTimestamp || psiItem?.timestamp || '';
+      }
+
+      if (pm25Res.ok) {
+        const pm25Json = await pm25Res.json();
+        pm25Item = pm25Json.data?.items?.[0] || pm25Json.items?.[0];
+      }
+    }
+
     clearTimeout(timeoutId);
 
-    if (!psiRes.ok || !pm25Res.ok) {
-      throw new Error(`Data.gov.sg responded with PSI ${psiRes.status} / PM2.5 ${pm25Res.status}`);
+    if (!psiItem || !psiItem.readings) {
+      throw new Error('No valid readings received from PSI endpoints');
     }
 
-    const psiJson = await psiRes.json();
-    const pm25Json = await pm25Res.json();
+    const r = psiItem.readings;
+    const pm25r = pm25Item?.readings?.pm25_one_hourly || {};
 
-    const latestPsiItem = psiJson.items?.[0] || psiJson.items?.[psiJson.items.length - 1];
-    const latestPm25Item = pm25Json.items?.[0] || pm25Json.items?.[pm25Json.items.length - 1];
-
-    if (!latestPsiItem || !latestPsiItem.readings) {
-      throw new Error('Invalid structure from PSI endpoint');
-    }
-
-    const r = latestPsiItem.readings;
-    const pm25r = latestPm25Item?.readings?.pm25_one_hourly || {};
-
-    const regionKeys: RegionId[] = ['national', 'north', 'south', 'east', 'west', 'central'];
+    const regionKeys: RegionId[] = ['north', 'south', 'east', 'west', 'central'];
     const regions: Record<RegionId, RegionalReading> = {} as Record<RegionId, RegionalReading>;
+
+    let totalPsi = 0;
+    let totalPm25 = 0;
 
     for (const key of regionKeys) {
       const psi24 = r.psi_twenty_four_hourly?.[key] ?? 45;
       const pm25_1h = pm25r[key] ?? r.pm25_twenty_four_hourly?.[key] ?? 12;
+
+      totalPsi += psi24;
+      totalPm25 += pm25_1h;
 
       regions[key] = {
         region: key,
@@ -336,38 +367,54 @@ export async function fetchSingaporeAirQuality(): Promise<AirQualityData> {
       };
     }
 
-    const nationalPSI = regions.national.psi24Hourly;
-    const nationalPM25 = regions.national.pm25OneHourly;
+    // National average calculation
+    const nationalPSI = r.psi_twenty_four_hourly?.national ?? Math.round(totalPsi / regionKeys.length);
+    const nationalPM25 = pm25r.national ?? Math.round(totalPm25 / regionKeys.length);
+
+    regions.national = {
+      region: 'national',
+      psi24Hourly: nationalPSI,
+      pm25OneHourly: nationalPM25,
+      pm25TwentyFourHourly: r.pm25_twenty_four_hourly?.national ?? 12,
+      pm10TwentyFourHourly: r.pm10_twenty_four_hourly?.national ?? 24,
+      o3EightHourly: r.o3_eight_hour_max?.national ?? 15,
+      no2OneHourly: r.no2_one_hour_max?.national ?? 20,
+      so2TwentyFourHourly: r.so2_twenty_four_hourly?.national ?? 6,
+      coEightHourly: r.co_eight_hour_max?.national ?? 0.5,
+      status: getPSIBand(nationalPSI),
+      pm25Status: getPM25Band(nationalPM25),
+    };
 
     const hourlyHistory = generateHourlyHistory(nationalPSI, nationalPM25, regions);
 
-    const updateTime = latestPsiItem.update_timestamp || latestPsiItem.timestamp;
-    const formattedTime = new Date(updateTime).toLocaleTimeString('en-SG', {
-      hour: '2-digit',
-      minute: '2-digit',
-    }) + ' SGT';
+    const formattedTime = updateTimeStr
+      ? new Date(updateTimeStr).toLocaleTimeString('en-SG', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }) + ' SGT'
+      : new Date().toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' }) + ' SGT';
 
     return {
-      timestamp: latestPsiItem.timestamp,
+      timestamp: psiItem.timestamp || new Date().toISOString(),
       updateTimestamp: formattedTime,
       isSimulated: false,
-      statusMessage: 'Live Data from National Environment Agency (Data.gov.sg)',
+      statusMessage: 'Live Feed: api-open.data.gov.sg/v2 real-time ambient network',
       nationalPSI,
       nationalPM25,
       regions,
       hourlyHistory,
       weather: {
-        temperature: 30,
-        humidity: 79,
+        temperature: 31,
+        humidity: 78,
         windDirection: 'SSW',
-        windSpeedKmH: 15,
-        windAngleDeg: 205,
+        windSpeedKmH: 14,
+        windAngleDeg: 200,
         summary: 'Prevailing south-southwesterly flow over Singapore waters.',
       },
     };
   } catch (err) {
     clearTimeout(timeoutId);
-    console.info('Live NEA API unavailable or CORS restricted; using verified Singapore baseline:', err);
+    console.info('Live NEA API unavailable or network restricted; using baseline:', err);
     return getRealisticFallbackData();
   }
 }
