@@ -56,3 +56,12 @@ include /health.ts and psi/ts within the same subfolder
 there is no key required for this service
 ```
 
+---
+
+### Prompt 6: Display OneMap on the Interactive Map
+
+```text
+display the map from onemap onto the interactive map of the webpage
+```
+
+

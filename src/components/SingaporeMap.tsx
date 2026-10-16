@@ -1,18 +1,15 @@
-import React, { useState } from 'react';
-import {
-  AirQualityData,
-  RegionId,
-} from '../types/airQuality';
+import React, { useEffect, useRef, useState } from 'react';
+import L from 'leaflet';
+import { AirQualityData, RegionId } from '../types/airQuality';
 import { SINGAPORE_REGIONS, getBandColor } from '../services/api';
 import {
-  Wind,
   Layers,
-  ZoomIn,
-  ZoomOut,
+  Search,
   RotateCcw,
-  Info,
-  Maximize2,
-  Navigation,
+  MapPin,
+  Wind,
+  X,
+  Compass,
 } from 'lucide-react';
 
 interface SingaporeMapProps {
@@ -23,6 +20,28 @@ interface SingaporeMapProps {
   onChangeMetric: (metric: 'psi' | 'pm25') => void;
 }
 
+type OneMapStyle = 'Night' | 'Default' | 'Grey' | 'Original';
+
+interface SearchResult {
+  SEARCHVAL: string;
+  ADDRESS: string;
+  POSTAL: string;
+  LATITUDE: string;
+  LONGITUDE: string;
+  BUILDING?: string;
+  ROAD_NAME?: string;
+  BLK_NO?: string;
+}
+
+const REGION_COORDINATES: Record<RegionId, [number, number]> = {
+  national: [1.3521, 103.8198],
+  north: [1.41803, 103.82],
+  south: [1.29587, 103.82],
+  east: [1.35735, 103.94],
+  west: [1.35735, 103.7],
+  central: [1.35735, 103.82],
+};
+
 export const SingaporeMap: React.FC<SingaporeMapProps> = ({
   data,
   selectedRegion,
@@ -30,62 +49,308 @@ export const SingaporeMap: React.FC<SingaporeMapProps> = ({
   activeMetric,
   onChangeMetric,
 }) => {
-  const [showWindVectors, setShowWindVectors] = useState(true);
-  const [showHeatmap, setShowHeatmap] = useState(true);
-  const [zoomLevel, setZoomLevel] = useState(1);
-  const [hoveredRegion, setHoveredRegion] = useState<RegionId | null>(null);
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
+  const mapInstanceRef = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const markersLayerRef = useRef<L.LayerGroup | null>(null);
+  const circlesLayerRef = useRef<L.LayerGroup | null>(null);
+  const searchMarkerRef = useRef<L.Marker | null>(null);
+
+  const [mapStyle, setMapStyle] = useState<OneMapStyle>('Night');
+  const [showHeatCircles, setShowHeatCircles] = useState<boolean>(true);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [isSearching, setIsSearching] = useState<boolean>(false);
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
 
   const activeRegionData = data.regions[selectedRegion];
 
-  // Colors for regions based on active metric
-  const getRegionValueAndBand = (regId: RegionId) => {
-    const reading = data.regions[regId];
-    if (!reading) return { value: 0, band: 'good' as const };
-    if (activeMetric === 'psi') {
-      return { value: reading.psi24Hourly, band: reading.status };
-    } else {
-      return { value: reading.pm25OneHourly, band: reading.pm25Status };
+  // Initialize Leaflet Map with OneMap Basemap
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+
+    if (!mapInstanceRef.current) {
+      const map = L.map(mapContainerRef.current, {
+        center: [1.3521, 103.8198],
+        zoom: 12,
+        minZoom: 11,
+        maxZoom: 18,
+        zoomControl: false,
+      });
+
+      // Zoom control in top right
+      L.control.zoom({ position: 'topright' }).addTo(map);
+
+      // OneMap Tile Layer
+      const tileLayer = L.tileLayer(
+        `https://www.onemap.gov.sg/maps/tiles/${mapStyle}/{z}/{x}/{y}.png`,
+        {
+          attribution:
+            '<img src="https://www.onemap.gov.sg/web-assets/images/logo/om_logo.png" style="height:14px;vertical-align:middle;display:inline-block;margin-right:4px;" alt="OneMap" /> <a href="https://www.onemap.gov.sg" target="_blank" rel="noopener">OneMap</a> &copy; Singapore Land Authority | NEA',
+          maxZoom: 18,
+          minZoom: 11,
+        }
+      ).addTo(map);
+
+      tileLayerRef.current = tileLayer;
+      markersLayerRef.current = L.layerGroup().addTo(map);
+      circlesLayerRef.current = L.layerGroup().addTo(map);
+      mapInstanceRef.current = map;
+    }
+
+    return () => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
+    };
+  }, []);
+
+  // Update OneMap Tile Layer style when mapStyle changes
+  useEffect(() => {
+    if (!mapInstanceRef.current || !tileLayerRef.current) return;
+
+    tileLayerRef.current.setUrl(
+      `https://www.onemap.gov.sg/maps/tiles/${mapStyle}/{z}/{x}/{y}.png`
+    );
+  }, [mapStyle]);
+
+  // Update Stations & Dispersion Circles on map
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const markersGroup = markersLayerRef.current;
+    const circlesGroup = circlesLayerRef.current;
+
+    if (!map || !markersGroup || !circlesGroup) return;
+
+    markersGroup.clearLayers();
+    circlesGroup.clearLayers();
+
+    const stationRegions: RegionId[] = ['north', 'south', 'east', 'west', 'central'];
+
+    stationRegions.forEach((regId) => {
+      const coords = REGION_COORDINATES[regId];
+      const reading = data.regions[regId];
+      if (!reading) return;
+
+      const value = activeMetric === 'psi' ? reading.psi24Hourly : reading.pm25OneHourly;
+      const band = activeMetric === 'psi' ? reading.status : reading.pm25Status;
+      const color = getBandColor(band);
+      const isSelected = selectedRegion === regId;
+
+      // 1. Dispersion Circle
+      if (showHeatCircles) {
+        const circle = L.circle(coords, {
+          radius: 5200,
+          color: color.hex,
+          fillColor: color.hex,
+          fillOpacity: isSelected ? 0.28 : 0.16,
+          weight: isSelected ? 2 : 1,
+          dashArray: isSelected ? '4, 4' : undefined,
+        });
+
+        circle.on('click', () => {
+          onSelectRegion(regId);
+        });
+
+        circlesGroup.addLayer(circle);
+      }
+
+      // 2. Custom Station Marker Pill
+      const customIcon = L.divIcon({
+        className: 'custom-onemap-marker',
+        html: `
+          <div style="
+            display: flex;
+            align-items: center;
+            background: #0f172a;
+            border: 2px solid ${color.hex};
+            border-radius: 9999px;
+            padding: 3px 10px;
+            color: #ffffff;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.6);
+            cursor: pointer;
+            transform: translate(-50%, -50%);
+            white-space: nowrap;
+            transition: transform 0.2s;
+            ${isSelected ? 'transform: translate(-50%, -50%) scale(1.12); ring: 4px rgba(6, 182, 212, 0.4);' : ''}
+          ">
+            <span style="font-family: monospace; font-size: 13px; font-weight: 700; margin-right: 6px;">
+              ${value}
+            </span>
+            <span style="
+              width: 8px;
+              height: 8px;
+              border-radius: 50%;
+              background-color: ${color.hex};
+              display: inline-block;
+              margin-right: 6px;
+            "></span>
+            <span style="font-size: 10px; text-transform: uppercase; color: #94a3b8; font-weight: 600;">
+              ${SINGAPORE_REGIONS[regId].shortName}
+            </span>
+          </div>
+        `,
+        iconSize: [80, 30],
+        iconAnchor: [40, 15],
+      });
+
+      const marker = L.marker(coords, { icon: customIcon });
+
+      marker.on('click', () => {
+        onSelectRegion(regId);
+      });
+
+      // Popup
+      marker.bindPopup(`
+        <div style="padding: 12px; min-width: 180px;">
+          <div style="font-size: 12px; font-weight: 700; color: #f8fafc; margin-bottom: 2px;">
+            ${SINGAPORE_REGIONS[regId].name}
+          </div>
+          <div style="font-size: 10px; color: #94a3b8; margin-bottom: 8px;">
+            ${SINGAPORE_REGIONS[regId].description}
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-family: monospace;">
+            <div style="background: rgba(2,6,23,0.6); padding: 4px 6px; border-radius: 4px; border: 1px solid #1e293b;">
+              <span style="font-size: 9px; color: #64748b; display: block;">24-hr PSI</span>
+              <span style="font-size: 13px; font-weight: bold; color: #ffffff;">${reading.psi24Hourly}</span>
+            </div>
+            <div style="background: rgba(2,6,23,0.6); padding: 4px 6px; border-radius: 4px; border: 1px solid #1e293b;">
+              <span style="font-size: 9px; color: #64748b; display: block;">1-hr PM2.5</span>
+              <span style="font-size: 13px; font-weight: bold; color: #ffffff;">${reading.pm25OneHourly}</span>
+            </div>
+          </div>
+        </div>
+      `);
+
+      markersGroup.addLayer(marker);
+    });
+  }, [data, activeMetric, selectedRegion, showHeatCircles, onSelectRegion]);
+
+  // Handle address / postal search from OneMap
+  const handleOneMapSearch = async (queryOverride?: string) => {
+    const val = queryOverride || searchQuery.trim();
+    if (!val) return;
+
+    setIsSearching(true);
+    setSearchError(null);
+
+    try {
+      const res = await fetch(`/api/onemap?searchVal=${encodeURIComponent(val)}`);
+      if (!res.ok) throw new Error('OneMap search failed');
+
+      const result = await res.json();
+      if (result.results && result.results.length > 0) {
+        const topResult: SearchResult = result.results[0];
+        setSearchResult(topResult);
+
+        const lat = parseFloat(topResult.LATITUDE);
+        const lng = parseFloat(topResult.LONGITUDE);
+
+        if (mapInstanceRef.current && !isNaN(lat) && !isNaN(lng)) {
+          mapInstanceRef.current.flyTo([lat, lng], 15, { duration: 1.2 });
+
+          // Remove prior search marker
+          if (searchMarkerRef.current) {
+            mapInstanceRef.current.removeLayer(searchMarkerRef.current);
+          }
+
+          const pinIcon = L.divIcon({
+            className: 'search-pin',
+            html: `
+              <div style="
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                transform: translate(-50%, -100%);
+              ">
+                <div style="
+                  background: #0284c7;
+                  color: white;
+                  padding: 4px 8px;
+                  border-radius: 6px;
+                  font-size: 11px;
+                  font-weight: 600;
+                  white-space: nowrap;
+                  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+                  border: 1px solid #38bdf8;
+                ">
+                  ${topResult.BUILDING || topResult.ROAD_NAME} (${topResult.POSTAL})
+                </div>
+                <div style="
+                  width: 0;
+                  height: 0;
+                  border-left: 6px solid transparent;
+                  border-right: 6px solid transparent;
+                  border-top: 7px solid #0284c7;
+                "></div>
+              </div>
+            `,
+            iconSize: [40, 40],
+            iconAnchor: [20, 40],
+          });
+
+          const newMarker = L.marker([lat, lng], { icon: pinIcon }).addTo(
+            mapInstanceRef.current
+          );
+
+          newMarker.bindPopup(`
+            <div style="padding: 10px; max-width: 220px;">
+              <div style="font-weight: bold; font-size: 12px; color: #ffffff;">${topResult.BUILDING || topResult.ROAD_NAME}</div>
+              <div style="font-size: 11px; color: #94a3b8; margin: 4px 0;">${topResult.ADDRESS}</div>
+              <div style="font-size: 10px; font-family: monospace; color: #38bdf8;">Postal Code: ${topResult.POSTAL}</div>
+            </div>
+          `).openPopup();
+
+          searchMarkerRef.current = newMarker;
+        }
+      } else {
+        setSearchError(`No Singapore locations found for "${val}"`);
+      }
+    } catch (err) {
+      setSearchError('Error connecting to OneMap Singapore service');
+    } finally {
+      setIsSearching(false);
     }
   };
 
-  const handleZoomIn = () => setZoomLevel((z) => Math.min(2.2, z + 0.25));
-  const handleZoomOut = () => setZoomLevel((z) => Math.max(0.85, z - 0.25));
-  const handleResetZoom = () => setZoomLevel(1);
-
-  // Station markers placement
-  const stationPins: {
-    id: RegionId;
-    name: string;
-    sub: string;
-    x: number;
-    y: number;
-  }[] = [
-    { id: 'north', name: 'North', sub: 'Woodlands', x: 490, y: 155 },
-    { id: 'central', name: 'Central', sub: 'Bishan', x: 495, y: 300 },
-    { id: 'south', name: 'South', sub: 'Marina Bay', x: 510, y: 440 },
-    { id: 'west', name: 'West', sub: 'Jurong East', x: 230, y: 325 },
-    { id: 'east', name: 'East', sub: 'Tampines', x: 745, y: 285 },
-  ];
+  const handleResetMap = () => {
+    if (mapInstanceRef.current) {
+      mapInstanceRef.current.flyTo([1.3521, 103.8198], 12, { duration: 0.8 });
+    }
+    if (searchMarkerRef.current && mapInstanceRef.current) {
+      mapInstanceRef.current.removeLayer(searchMarkerRef.current);
+      searchMarkerRef.current = null;
+    }
+    setSearchResult(null);
+  };
 
   return (
     <div className="relative w-full rounded-2xl bg-slate-900 border border-slate-800 text-white overflow-hidden shadow-sm flex flex-col">
-      {/* Map Control Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5 border-b border-slate-800/80 bg-slate-900/90 backdrop-blur-sm z-20">
+      {/* Map Control Bar Header */}
+      <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 border-b border-slate-800 bg-slate-900/95 backdrop-blur-md z-10">
         <div className="flex items-center gap-2">
-          <span className="text-xs uppercase tracking-wider text-slate-400 font-mono">Interactive Air Map</span>
+          <img
+            src="https://www.onemap.gov.sg/web-assets/images/logo/om_logo.png"
+            alt="OneMap Singapore"
+            className="h-4 object-contain"
+          />
+          <span className="text-xs font-semibold text-white tracking-wide">
+            OneMap Singapore
+          </span>
           <span className="text-slate-600">/</span>
-          <span className="text-xs text-slate-300 font-medium">Singapore Island</span>
+          <span className="text-xs text-slate-400 font-mono">Live Geospatial Layer</span>
         </div>
 
-        {/* Metric Selector & Layer Toggles */}
+        {/* Controls: Metric Switcher, Style, Layer */}
         <div className="flex flex-wrap items-center gap-2">
-          {/* Metric buttons */}
-          <div className="flex items-center bg-slate-800/90 p-1 rounded-lg border border-slate-700/60">
+          {/* 24-hr PSI vs 1-hr PM2.5 */}
+          <div className="flex items-center bg-slate-800 p-0.5 rounded-lg border border-slate-700/80">
             <button
               onClick={() => onChangeMetric('psi')}
               className={`px-3 py-1 text-xs font-medium rounded-md transition-all whitespace-nowrap ${
                 activeMetric === 'psi'
-                  ? 'bg-slate-100 text-slate-900 shadow-sm'
+                  ? 'bg-slate-100 text-slate-950 font-semibold shadow-xs'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
@@ -95,7 +360,7 @@ export const SingaporeMap: React.FC<SingaporeMapProps> = ({
               onClick={() => onChangeMetric('pm25')}
               className={`px-3 py-1 text-xs font-medium rounded-md transition-all whitespace-nowrap ${
                 activeMetric === 'pm25'
-                  ? 'bg-slate-100 text-slate-900 shadow-sm'
+                  ? 'bg-slate-100 text-slate-950 font-semibold shadow-xs'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
@@ -103,375 +368,123 @@ export const SingaporeMap: React.FC<SingaporeMapProps> = ({
             </button>
           </div>
 
-          {/* Layer toggles */}
-          <button
-            onClick={() => setShowWindVectors((v) => !v)}
-            title="Toggle Wind Stream Vectors"
-            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg border transition-colors whitespace-nowrap ${
-              showWindVectors
-                ? 'bg-cyan-950/60 border-cyan-700/70 text-cyan-300'
-                : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Wind className="w-3.5 h-3.5" />
-            <span>Wind ({data.weather.windDirection} {data.weather.windSpeedKmH} km/h)</span>
-          </button>
+          {/* OneMap Basemap Style Switcher */}
+          <div className="flex items-center gap-1 bg-slate-800 p-0.5 rounded-lg border border-slate-700/80 text-xs">
+            {(['Night', 'Default', 'Grey'] as OneMapStyle[]).map((style) => (
+              <button
+                key={style}
+                onClick={() => setMapStyle(style)}
+                className={`px-2 py-1 rounded transition-colors whitespace-nowrap ${
+                  mapStyle === style
+                    ? 'bg-cyan-600 text-white font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {style}
+              </button>
+            ))}
+          </div>
 
+          {/* Dispersion field toggle */}
           <button
-            onClick={() => setShowHeatmap((v) => !v)}
-            title="Toggle Particle Heatmap Dispersion"
+            onClick={() => setShowHeatCircles((v) => !v)}
             className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg border transition-colors whitespace-nowrap ${
-              showHeatmap
-                ? 'bg-amber-950/60 border-amber-700/70 text-amber-300'
-                : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
+              showHeatCircles
+                ? 'bg-cyan-950/60 border-cyan-700 text-cyan-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
-            <span>Dispersion Field</span>
+            <span>Air Quality Field</span>
           </button>
 
-          {/* Zoom Controls */}
-          <div className="flex items-center gap-1 bg-slate-800/90 p-1 rounded-lg border border-slate-700/60">
-            <button
-              onClick={handleZoomIn}
-              className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-700"
-              title="Zoom In"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={handleZoomOut}
-              className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-700"
-              title="Zoom Out"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={handleResetZoom}
-              className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-700"
-              title="Reset View"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-            </button>
-          </div>
+          {/* Reset View */}
+          <button
+            onClick={handleResetMap}
+            title="Reset Singapore Map View"
+            className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg border border-slate-700/80 transition-colors"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
 
-      {/* Main SVG Viewport */}
-      <div className="relative w-full h-[380px] sm:h-[460px] lg:h-[510px] overflow-hidden bg-slate-950 flex items-center justify-center cursor-default select-none">
-        {/* Subtle Water & Strait Grid Background */}
-        <div
-          className="absolute inset-0 opacity-20 pointer-events-none"
-          style={{
-            backgroundImage: `radial-gradient(circle at 1px 1px, #334155 1px, transparent 0)`,
-            backgroundSize: '28px 28px',
+      {/* OneMap Search Bar for Singapore Locations & Postal Codes */}
+      <div className="px-5 py-2.5 bg-slate-950/90 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs z-10">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleOneMapSearch();
           }}
-        />
-
-        {/* Straits labels */}
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 text-[10px] font-mono tracking-widest text-slate-600 uppercase pointer-events-none">
-          Straits of Johor / Malaysia Border
-        </div>
-        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 text-[10px] font-mono tracking-widest text-slate-600 uppercase pointer-events-none">
-          Singapore Strait / Riau Archipelago
-        </div>
-
-        {/* SVG Container with Zoom */}
-        <div
-          className="w-full h-full flex items-center justify-center transition-transform duration-300 ease-out"
-          style={{ transform: `scale(${zoomLevel})` }}
+          className="flex-1 max-w-md flex items-center gap-2"
         >
-          <svg
-            viewBox="0 0 980 620"
-            className="w-full h-full max-h-full max-w-full drop-shadow-xl"
-            style={{ filter: 'drop-shadow(0 15px 30px rgba(0,0,0,0.6))' }}
+          <div className="relative flex-1">
+            <input
+              type="text"
+              placeholder="Search Singapore postal code (e.g. 178903) or landmark..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-slate-900 border border-slate-700 text-white placeholder-slate-500 rounded-lg pl-8 pr-3 py-1.5 text-xs focus:outline-hidden focus:border-cyan-500"
+            />
+            <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+          </div>
+          <button
+            type="submit"
+            disabled={isSearching}
+            className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-medium transition-colors whitespace-nowrap shrink-0"
           >
-            <defs>
-              {/* Radial gradients for regional atmospheric dispersion */}
-              <radialGradient id="grad-north" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor={getBandColor(getRegionValueAndBand('north').band).hex} stopOpacity="0.45" />
-                <stop offset="100%" stopColor={getBandColor(getRegionValueAndBand('north').band).hex} stopOpacity="0" />
-              </radialGradient>
+            {isSearching ? 'Locating...' : 'Locate'}
+          </button>
+        </form>
 
-              <radialGradient id="grad-south" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor={getBandColor(getRegionValueAndBand('south').band).hex} stopOpacity="0.45" />
-                <stop offset="100%" stopColor={getBandColor(getRegionValueAndBand('south').band).hex} stopOpacity="0" />
-              </radialGradient>
-
-              <radialGradient id="grad-east" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor={getBandColor(getRegionValueAndBand('east').band).hex} stopOpacity="0.45" />
-                <stop offset="100%" stopColor={getBandColor(getRegionValueAndBand('east').band).hex} stopOpacity="0" />
-              </radialGradient>
-
-              <radialGradient id="grad-west" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor={getBandColor(getRegionValueAndBand('west').band).hex} stopOpacity="0.45" />
-                <stop offset="100%" stopColor={getBandColor(getRegionValueAndBand('west').band).hex} stopOpacity="0" />
-              </radialGradient>
-
-              <radialGradient id="grad-central" cx="50%" cy="50%" r="50%">
-                <stop offset="0%" stopColor={getBandColor(getRegionValueAndBand('central').band).hex} stopOpacity="0.45" />
-                <stop offset="100%" stopColor={getBandColor(getRegionValueAndBand('central').band).hex} stopOpacity="0" />
-              </radialGradient>
-
-              {/* Marker pulse glow filter */}
-              <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-                <feGaussianBlur stdDeviation="3" result="blur" />
-                <feComposite in="SourceGraphic" in2="blur" operator="over" />
-              </filter>
-            </defs>
-
-            {/* Heatmap overlay (dispersion field) */}
-            {showHeatmap && (
-              <g className="transition-opacity duration-500 opacity-80 pointer-events-none">
-                <circle cx="490" cy="155" r="140" fill="url(#grad-north)" />
-                <circle cx="230" cy="325" r="180" fill="url(#grad-west)" />
-                <circle cx="495" cy="300" r="130" fill="url(#grad-central)" />
-                <circle cx="510" cy="440" r="140" fill="url(#grad-south)" />
-                <circle cx="745" cy="285" r="160" fill="url(#grad-east)" />
-              </g>
-            )}
-
-            {/* ===================== REGION PATHS (SINGAPORE MAINLAND & ISLANDS) ===================== */}
-            <g id="singapore-regions" className="cursor-pointer">
-              {/* WEST REGION: Tuas, Jurong, Clementi, Bukit Batok */}
-              <path
-                id="region-west"
-                d="M 60,370 L 105,395 L 140,430 L 175,410 L 220,400 L 290,410 L 340,380 L 360,320 L 375,250 L 335,210 L 275,185 L 210,210 L 155,265 L 115,310 Z"
-                className={`transition-all duration-200 stroke-slate-700/80 stroke-2 ${
-                  selectedRegion === 'west'
-                    ? 'fill-cyan-950/80 stroke-cyan-400 stroke-[3px]'
-                    : hoveredRegion === 'west'
-                    ? 'fill-slate-800 stroke-slate-500'
-                    : 'fill-slate-900/90 hover:fill-slate-800/80'
-                }`}
-                onClick={() => onSelectRegion('west')}
-                onMouseEnter={() => setHoveredRegion('west')}
-                onMouseLeave={() => setHoveredRegion(null)}
-              />
-
-              {/* NORTH REGION: Woodlands, Sembawang, Yishun, Sungei Buloh */}
-              <path
-                id="region-north"
-                d="M 335,210 L 375,250 L 400,240 L 440,240 L 530,230 L 575,220 L 590,170 L 575,120 L 520,95 L 450,90 L 380,115 L 340,150 Z"
-                className={`transition-all duration-200 stroke-slate-700/80 stroke-2 ${
-                  selectedRegion === 'north'
-                    ? 'fill-cyan-950/80 stroke-cyan-400 stroke-[3px]'
-                    : hoveredRegion === 'north'
-                    ? 'fill-slate-800 stroke-slate-500'
-                    : 'fill-slate-900/90 hover:fill-slate-800/80'
-                }`}
-                onClick={() => onSelectRegion('north')}
-                onMouseEnter={() => setHoveredRegion('north')}
-                onMouseLeave={() => setHoveredRegion(null)}
-              />
-
-              {/* CENTRAL REGION: Bishan, Toa Payoh, Ang Mo Kio, Novena, Bukit Timah */}
-              <path
-                id="region-central"
-                d="M 360,320 L 375,250 L 440,240 L 530,230 L 580,240 L 575,320 L 550,370 L 485,385 L 430,370 L 370,360 Z"
-                className={`transition-all duration-200 stroke-slate-700/80 stroke-2 ${
-                  selectedRegion === 'central'
-                    ? 'fill-cyan-950/80 stroke-cyan-400 stroke-[3px]'
-                    : hoveredRegion === 'central'
-                    ? 'fill-slate-800 stroke-slate-500'
-                    : 'fill-slate-900/90 hover:fill-slate-800/80'
-                }`}
-                onClick={() => onSelectRegion('central')}
-                onMouseEnter={() => setHoveredRegion('central')}
-                onMouseLeave={() => setHoveredRegion(null)}
-              />
-
-              {/* EAST REGION: Tampines, Bedok, Changi, Pasir Ris */}
-              <path
-                id="region-east"
-                d="M 575,220 L 580,240 L 575,320 L 610,360 L 670,375 L 750,375 L 850,340 L 890,290 L 870,240 L 810,210 L 730,195 L 650,200 Z"
-                className={`transition-all duration-200 stroke-slate-700/80 stroke-2 ${
-                  selectedRegion === 'east'
-                    ? 'fill-cyan-950/80 stroke-cyan-400 stroke-[3px]'
-                    : hoveredRegion === 'east'
-                    ? 'fill-slate-800 stroke-slate-500'
-                    : 'fill-slate-900/90 hover:fill-slate-800/80'
-                }`}
-                onClick={() => onSelectRegion('east')}
-                onMouseEnter={() => setHoveredRegion('east')}
-                onMouseLeave={() => setHoveredRegion(null)}
-              />
-
-              {/* SOUTH REGION: Marina Bay, Tanjong Pagar, Bukit Merah, Keppel */}
-              <path
-                id="region-south"
-                d="M 370,360 L 430,370 L 485,385 L 550,370 L 610,360 L 615,410 L 580,455 L 520,470 L 450,470 L 380,440 L 350,410 Z"
-                className={`transition-all duration-200 stroke-slate-700/80 stroke-2 ${
-                  selectedRegion === 'south'
-                    ? 'fill-cyan-950/80 stroke-cyan-400 stroke-[3px]'
-                    : hoveredRegion === 'south'
-                    ? 'fill-slate-800 stroke-slate-500'
-                    : 'fill-slate-900/90 hover:fill-slate-800/80'
-                }`}
-                onClick={() => onSelectRegion('south')}
-                onMouseEnter={() => setHoveredRegion('south')}
-                onMouseLeave={() => setHoveredRegion(null)}
-              />
-
-              {/* ISLANDS: Jurong Island */}
-              <path
-                id="jurong-island"
-                d="M 180,455 C 220,445 280,455 260,505 C 230,525 180,515 170,480 Z"
-                className="fill-slate-800 stroke-slate-700 hover:fill-slate-700 transition-colors"
-                onClick={() => onSelectRegion('west')}
-              />
-
-              {/* ISLANDS: Sentosa */}
-              <path
-                id="sentosa-island"
-                d="M 460,495 C 490,485 530,490 535,510 C 510,525 465,515 460,495 Z"
-                className="fill-slate-800 stroke-slate-700 hover:fill-slate-700 transition-colors"
-                onClick={() => onSelectRegion('south')}
-              />
-
-              {/* ISLANDS: Pulau Ubin */}
-              <path
-                id="pulau-ubin"
-                d="M 730,165 C 770,155 810,160 800,185 C 770,195 725,185 730,165 Z"
-                className="fill-slate-800 stroke-slate-700 hover:fill-slate-700 transition-colors"
-                onClick={() => onSelectRegion('east')}
-              />
-
-              {/* ISLANDS: Pulau Tekong */}
-              <path
-                id="pulau-tekong"
-                d="M 830,165 C 875,155 905,175 895,215 C 860,225 830,205 830,165 Z"
-                className="fill-slate-800 stroke-slate-700 hover:fill-slate-700 transition-colors"
-                onClick={() => onSelectRegion('east')}
-              />
-            </g>
-
-            {/* Region name labels */}
-            <g className="pointer-events-none select-none text-[13px] font-semibold tracking-wide">
-              <text x="490" y="140" textAnchor="middle" fill="#94A3B8" className="uppercase font-mono text-[11px]">
-                North
-              </text>
-              <text x="230" y="305" textAnchor="middle" fill="#94A3B8" className="uppercase font-mono text-[11px]">
-                West
-              </text>
-              <text x="485" y="285" textAnchor="middle" fill="#94A3B8" className="uppercase font-mono text-[11px]">
-                Central
-              </text>
-              <text x="750" y="265" textAnchor="middle" fill="#94A3B8" className="uppercase font-mono text-[11px]">
-                East
-              </text>
-              <text x="500" y="425" textAnchor="middle" fill="#94A3B8" className="uppercase font-mono text-[11px]">
-                South
-              </text>
-            </g>
-
-            {/* Wind Direction Vectors (animated stream arrows) */}
-            {showWindVectors && (
-              <g className="pointer-events-none opacity-60">
-                {[
-                  { x: 180, y: 560 },
-                  { x: 380, y: 550 },
-                  { x: 620, y: 560 },
-                  { x: 320, y: 390 },
-                  { x: 520, y: 360 },
-                  { x: 740, y: 360 },
-                  { x: 420, y: 190 },
-                  { x: 660, y: 170 },
-                ].map((pos, idx) => (
-                  <g
-                    key={idx}
-                    transform={`translate(${pos.x}, ${pos.y}) rotate(${data.weather.windAngleDeg - 180})`}
-                  >
-                    <line
-                      x1="0"
-                      y1="-20"
-                      x2="0"
-                      y2="20"
-                      stroke="#38BDF8"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeDasharray="4 3"
-                    />
-                    <polygon points="-4,-14 0,-24 4,-14" fill="#38BDF8" />
-                  </g>
-                ))}
-              </g>
-            )}
-
-            {/* Station Pins & Readings */}
-            <g id="station-markers">
-              {stationPins.map((pin) => {
-                const { value, band } = getRegionValueAndBand(pin.id);
-                const color = getBandColor(band);
-                const isSelected = selectedRegion === pin.id;
-
-                return (
-                  <g
-                    key={pin.id}
-                    transform={`translate(${pin.x}, ${pin.y})`}
-                    className="cursor-pointer group"
-                    onClick={() => onSelectRegion(pin.id)}
-                  >
-                    {/* Ring highlight if selected */}
-                    {isSelected && (
-                      <circle
-                        r="34"
-                        fill="none"
-                        stroke={color.hex}
-                        strokeWidth="2"
-                        strokeDasharray="4 2"
-                        className="animate-spin"
-                        style={{ transformOrigin: '0px 0px', animationDuration: '10s' }}
-                      />
-                    )}
-
-                    {/* Background badge pill for reading */}
-                    <rect
-                      x="-42"
-                      y="-18"
-                      width="84"
-                      height="36"
-                      rx="18"
-                      fill="#0F172A"
-                      stroke={color.hex}
-                      strokeWidth={isSelected ? '2.5' : '1.5'}
-                      className="transition-all duration-200 group-hover:stroke-white"
-                      filter="url(#glow)"
-                    />
-
-                    {/* Numeric Value */}
-                    <text
-                      x="-14"
-                      y="5"
-                      textAnchor="middle"
-                      fill="#F8FAFC"
-                      className="font-mono font-bold text-[16px] tabular-nums"
-                    >
-                      {value}
-                    </text>
-
-                    {/* Metric Unit / Band Icon */}
-                    <circle cx="24" cy="0" r="5" fill={color.hex} />
-
-                    {/* Station Town Name Sub-label */}
-                    <text
-                      x="0"
-                      y="28"
-                      textAnchor="middle"
-                      fill="#94A3B8"
-                      className="font-mono text-[10px] uppercase tracking-wider group-hover:fill-white"
-                    >
-                      {pin.sub}
-                    </text>
-                  </g>
-                );
-              })}
-            </g>
-          </svg>
+        {/* Quick Location Pills */}
+        <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+          <span className="font-mono text-slate-500 hidden sm:inline">Try:</span>
+          <button
+            onClick={() => {
+              setSearchQuery('178903');
+              handleOneMapSearch('178903');
+            }}
+            className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+          >
+            SMU (178903)
+          </button>
+          <button
+            onClick={() => {
+              setSearchQuery('Marina Bay Sands');
+              handleOneMapSearch('Marina Bay Sands');
+            }}
+            className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+          >
+            Marina Bay Sands
+          </button>
+          <button
+            onClick={() => {
+              setSearchQuery('Changi Airport');
+              handleOneMapSearch('Changi Airport');
+            }}
+            className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+          >
+            Changi Airport
+          </button>
         </div>
+      </div>
 
-        {/* Selected Region Quick HUD Card Overlay (Bottom Left) */}
-        <div className="absolute bottom-4 left-4 z-20 max-w-[280px] sm:max-w-xs bg-slate-900/90 backdrop-blur-md p-3.5 rounded-xl border border-slate-700/70 shadow-lg text-xs">
+      {searchError && (
+        <div className="px-5 py-2 bg-rose-950/80 border-b border-rose-800 text-rose-300 text-xs flex items-center justify-between">
+          <span>{searchError}</span>
+          <button onClick={() => setSearchError(null)} className="p-0.5 hover:text-white">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* Main Map Canvas */}
+      <div className="relative w-full h-[400px] sm:h-[480px] lg:h-[540px]">
+        <div ref={mapContainerRef} className="w-full h-full z-0" />
+
+        {/* Selected Sector Floating HUD */}
+        <div className="absolute bottom-4 left-4 z-10 max-w-[280px] sm:max-w-xs bg-slate-900/90 backdrop-blur-md p-3.5 rounded-xl border border-slate-700/80 shadow-xl text-xs pointer-events-auto">
           <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-800">
             <div>
               <div className="font-semibold text-white text-sm">
@@ -493,13 +506,13 @@ export const SingaporeMap: React.FC<SingaporeMapProps> = ({
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-slate-300">
-            <div className="bg-slate-950/50 p-2 rounded border border-slate-800">
+            <div className="bg-slate-950/60 p-2 rounded border border-slate-800">
               <span className="text-[10px] uppercase font-mono text-slate-400 block">24-hr PSI</span>
               <span className="text-xl font-bold font-mono tabular-nums text-white">
                 {activeRegionData.psi24Hourly}
               </span>
             </div>
-            <div className="bg-slate-950/50 p-2 rounded border border-slate-800">
+            <div className="bg-slate-950/60 p-2 rounded border border-slate-800">
               <span className="text-[10px] uppercase font-mono text-slate-400 block">1-hr PM2.5</span>
               <span className="text-xl font-bold font-mono tabular-nums text-white">
                 {activeRegionData.pm25OneHourly}{' '}
@@ -509,8 +522,8 @@ export const SingaporeMap: React.FC<SingaporeMapProps> = ({
           </div>
         </div>
 
-        {/* Legend Overlay (Bottom Right) */}
-        <div className="hidden sm:block absolute bottom-4 right-4 z-20 bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-slate-700/70 text-[11px] text-slate-300 font-mono">
+        {/* Legend Overlay */}
+        <div className="hidden sm:block absolute bottom-4 right-4 z-10 bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-slate-700/80 text-[11px] text-slate-300 font-mono pointer-events-auto">
           <div className="text-[10px] uppercase tracking-wider text-slate-400 mb-1.5 font-bold">
             {activeMetric === 'psi' ? 'NEA PSI Scale' : '1-Hr PM2.5 Scale (µg/m³)'}
           </div>
